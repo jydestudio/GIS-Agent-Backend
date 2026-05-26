@@ -31,6 +31,8 @@ You have access to specific local GIS tools. You must ONLY plan within these cap
     - **LEGENDS**: You MUST provide a `"label"` inside the `"style"` dictionary for every layer.
     - This tool DOES NOT download data. It only STYLES and RENDERS.
     - You must pass the `file_path` from `download_admin_boundary` into the `data` field of the `layers_json`.
+    - **TILE LAYERS (GEE raster maps)**: After `run_gee_analysis`, you can produce a cartographic PNG by passing a `type="tile"` layer with `data` set to the `tile_url` from the analysis result. Copy the `vis_params` into the tile style: `palette`, `vmin` (from min), `vmax` (from max), and add a `colorbar_label` (e.g. "Elevation (m)", "Slope (°)").
+    - **IMPORTANT**: Tile layers are boundless. You MUST include the study area boundary as a separate vector layer alongside the tile layer so the map has a defined extent. Set the boundary's `face_alpha` to `0.0` with a visible `edge_color` so the raster shows through.
 
 ---
 
@@ -42,8 +44,8 @@ Step 1 → download_admin_boundary(location)
 Step 2 → search_gee_catalog(query)
 ↓ get dataset id
 Step 3 → run_gee_analysis(task, dataset_id, file_path, params)
-↓ get tile_url and export_id
-Step 4 → create_cartographic_map (only for boundary/vector maps)
+↓ get tile_url, vis_params, and export_id
+Step 4 → create_cartographic_map (for boundary maps AND raster/tile maps)
 
 ---
 
@@ -77,8 +79,11 @@ Many GIS analyses require **multiple datasets combined**. You must recognize whe
 ### For terrain analysis (slope, dem, contour, hillshade):
 1. Call `download_admin_boundary` → get `file_path`
 2. Call `search_gee_catalog("SRTM elevation terrain global")` → get `dataset_id`
-3. Call `run_gee_analysis(task, dataset_id, file_path, params)`
-4. Report the `tile_url`, `stats`, and `export_options` to the user
+3. Call `run_gee_analysis(task, dataset_id, file_path, params)` → get `tile_url`, `vis_params`, `stats`
+4. Call `create_cartographic_map` with TWO layers:
+   - A `type="vector"` layer using the boundary `file_path` (face_alpha=0.0, visible edge_color)
+   - A `type="tile"` layer using the `tile_url`, with `palette`, `vmin`, `vmax` copied from `vis_params`, plus a descriptive `colorbar_label`
+5. Report the map, `stats`, and `export_options` to the user
 
 ### For multi-parameter satellite analysis:
 1. Call `download_admin_boundary` → get `file_path`

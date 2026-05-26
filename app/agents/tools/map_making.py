@@ -209,6 +209,27 @@ class RasterStyle:
 
 
 @dataclass
+class TileStyle:
+    """Style settings for a GEE XYZ tile layer.
+
+    The palette, vmin, and vmax should come directly from the
+    vis_params returned by run_gee_analysis so the colorbar on the
+    static map matches the frontend tile rendering exactly.
+    """
+    label: str = "Tile Layer"
+    palette: list = field(default_factory=list)   # List of HEX colours from vis_params
+    vmin: Optional[float] = None                  # vis_params["min"]
+    vmax: Optional[float] = None                  # vis_params["max"]
+    alpha: float = 1.0
+    zoom: Optional[int] = None                    # XYZ tile zoom; None = auto
+    show_colorbar: bool = True
+    colorbar_label: str = ""                      # e.g. "Elevation (m)", "Slope (°)"
+    colorbar_orientation: Literal["vertical", "horizontal"] = "vertical"
+    colorbar_shrink: float = 0.6
+    colorbar_pad: float = 0.02
+
+
+@dataclass
 class MapConfig:
     """Master configuration object for a complete map."""
 
@@ -648,6 +669,82 @@ def _render_raster_layer(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ⑤b TILE LAYER RENDERER (GEE XYZ tiles)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _render_tile_layer(
+    ax: plt.Axes,
+    tile_url: str,
+    style: TileStyle,
+    xlim: tuple,
+    ylim: tuple,
+) -> None:
+    """
+    Overlay a GEE XYZ tile layer on the axes and draw a matching colorbar.
+
+    The tile imagery is fetched via contextily.  A synthetic colorbar is
+    built from the palette / vmin / vmax stored in TileStyle so the
+    symbology on the static map matches the GEE analysis output exactly.
+    """
+    if not HAS_CONTEXTILY:
+        raise ImportError(
+            "contextily is required for tile layers. "
+            "Install with: pip install contextily"
+        )
+
+    # ── Determine zoom level ──────────────────────────────────
+    # Higher zoom = more tiles = better resolution but slower.
+    # GEE tiles are 256×256; we need enough zoom so that the
+    # composited image looks sharp at the output DPI.
+    if style.zoom is not None:
+        zoom = style.zoom
+    else:
+        extent_deg = max(xlim[1] - xlim[0], ylim[1] - ylim[0])
+        extent_m   = extent_deg * 111_000
+        zoom = (
+            16 if extent_m < 1_000       # neighbourhood / site
+            else 15 if extent_m < 3_000  # small town
+            else 14 if extent_m < 8_000  # city district
+            else 13 if extent_m < 20_000 # city
+            else 12 if extent_m < 50_000 # metro / LGA
+            else 11 if extent_m < 120_000 # large LGA / small state
+            else 10 if extent_m < 300_000 # state (e.g. Benue)
+            else 9  if extent_m < 600_000 # large state / small country
+            else 8                        # country-scale
+        )
+
+    # ── Fetch and overlay tiles ───────────────────────────────
+    ctx.add_basemap(
+        ax,
+        crs="EPSG:4326",
+        source=tile_url,
+        zoom=zoom,
+        alpha=style.alpha,
+        attribution=False,
+        zorder=2,
+    )
+
+    # ── Draw colorbar from palette ────────────────────────────
+    if style.show_colorbar and style.palette and style.vmin is not None and style.vmax is not None:
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "gee_palette", style.palette, N=256
+        )
+        norm = mcolors.Normalize(vmin=style.vmin, vmax=style.vmax)
+        sm   = ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+
+        cbar = plt.colorbar(
+            sm, ax=ax,
+            orientation=style.colorbar_orientation,
+            shrink=style.colorbar_shrink,
+            pad=style.colorbar_pad,
+        )
+        if style.colorbar_label:
+            cbar.set_label(style.colorbar_label, fontsize=9)
+        cbar.ax.tick_params(labelsize=8)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ⑥ MASTER MAP RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -661,9 +758,9 @@ def render_map(
     Parameters
     ----------
     layers : list of dicts, each with keys:
-        - "type"   : "vector" | "raster" | "csv"
-        - "data"   : file path (str) or GeoDataFrame
-        - "style"  : VectorStyle | RasterStyle instance
+        - "type"   : "vector" | "raster" | "csv" | "tile"
+        - "data"   : file path (str), GeoDataFrame, or XYZ tile URL
+        - "style"  : VectorStyle | RasterStyle | TileStyle instance
         - "crs"    : optional CRS string (default "EPSG:4326")
     config : MapConfig
         Master configuration for the whole map.
@@ -678,6 +775,9 @@ def render_map(
     all_bounds: list[np.ndarray] = []
     legend_handles: list = []
 
+    # ── Collect tile layers to render AFTER extent is set ──────
+    deferred_tile_layers: list[dict] = []
+
     # ── Process each layer ────────────────────────────────────
     for layer in layers:
         ltype  = layer.get("type", "vector").lower()
@@ -685,7 +785,14 @@ def render_map(
         style  = layer.get("style")
         crs    = layer.get("crs", "EPSG:4326")
 
-        if ltype == "raster":
+        if ltype == "tile":
+            # Tile layers need the final extent; defer rendering.
+            if style is None:
+                style = TileStyle()
+            deferred_tile_layers.append({"data": data, "style": style})
+            # Tiles are boundless — extent is driven by other layers.
+
+        elif ltype == "raster":
             if style is None:
                 style = RasterStyle()
             bounds = _render_raster_layer(ax, data, style)
@@ -756,6 +863,16 @@ def render_map(
             zoom=z, attribution=False, zorder=1
         )
 
+    # ── Deferred tile layers (GEE XYZ) ───────────────────────
+    for tile_layer in deferred_tile_layers:
+        _render_tile_layer(
+            ax,
+            tile_url=tile_layer["data"],
+            style=tile_layer["style"],
+            xlim=xlim,
+            ylim=ylim,
+        )
+
     # ── Spines ───────────────────────────────────────────────
     for sp in ax.spines.values():
         sp.set_edgecolor(config.spine_color)
@@ -820,17 +937,28 @@ def render_map(
 def create_cartographic_map(
     layers_json: Annotated[str, (
         "JSON array of layer objects. Each object must have: "
-        "'type' ('vector'|'raster'|'csv'), "
-        "'data' (file path or GeoJSON string), "
+        "'type' ('vector'|'raster'|'csv'|'tile'), "
+        "'data' (file path, GeoJSON string, or XYZ tile URL), "
         "'style' (optional style dict). "
 
         "Style Rules:\n"
             "- All colors (face_color, edge_color, point_color, line_color) MUST be HEX format (e.g. '#3A86FF').\n"
             "- Do NOT use named colors like 'red', 'blue', etc.\n"
 
+        "TILE LAYERS (GEE raster analysis results):\n"
+            "- Use type='tile' with data=tile_url from run_gee_analysis.\n"
+            "- Pass vis_params into the style: palette, vmin, vmax, colorbar_label.\n"
+            "- You MUST include a vector layer (the study area boundary) alongside "
+            "the tile layer so the map extent is correctly framed.\n"
+            "- Example tile style: {\"palette\":[\"#003300\",\"#cccc00\",\"#ffffff\"],"
+            "\"vmin\":100,\"vmax\":900,\"colorbar_label\":\"Elevation (m)\",\"label\":\"DEM\"}\n"
 
-        "Example: [{\"type\":\"vector\",\"data\":\"/path/to/file.shp\","
-        "\"style\":{\"face_color\":\"#3A86FF\",\"label\":\"Study Area\"}}]"
+        "Example: [{\"type\":\"vector\",\"data\":\"/path/to/boundary.geojson\","
+        "\"style\":{\"face_color\":\"#3A86FF\",\"face_alpha\":0.0,\"edge_color\":\"#FF0000\","
+        "\"label\":\"Study Area\"}},"
+        "{\"type\":\"tile\",\"data\":\"https://earthengine.googleapis.com/...\","
+        "\"style\":{\"palette\":[\"#003300\",\"#ffffff\"],\"vmin\":0,\"vmax\":3000,"
+        "\"colorbar_label\":\"Elevation (m)\",\"label\":\"DEM\"}}]"
     )],
     config_json: Annotated[str, (
         "JSON object for map configuration. Supports all MapConfig fields plus nested "
@@ -848,7 +976,7 @@ def create_cartographic_map(
     )] = "{}",
 ) -> str:
     """
-    Create a fully-cartographed PNG map from vector or raster data.
+    Create a fully-cartographed PNG map from vector, raster, or GEE tile data.
 
     Styling Rules:
         - All colors MUST be in HEX format (e.g. '#FF5733').
@@ -865,10 +993,17 @@ def create_cartographic_map(
         - For lines → use "line_color"
         - "color" alone is NOT reliable
 
+        GEE TILE LAYER RULES:
+        - Use type='tile' with data set to the tile_url from run_gee_analysis.
+        - Copy vis_params into the style object:
+          palette (list of HEX strings), vmin, vmax, colorbar_label.
+        - ALWAYS include a boundary vector layer alongside the tile so the map
+          has a defined extent.
 
     Supports:
     - Vector layers: GeoJSON, Shapefile, CSV with coordinates
     - Raster layers: GeoTIFF (single-band or multi-band)
+    - Tile layers: GEE XYZ tile URLs with matching symbology colorbar
     - Satellite/OSM basemap overlay
     - Configurable: title, subtitle, north arrow (position), scale bar,
       coordinate grid (DMS or decimal), legend, color ramps, choropleth,
@@ -988,7 +1123,9 @@ def create_cartographic_map(
             if "name" in layer and "label" not in raw_style:
                 raw_style["label"] = layer["name"]
 
-            if ltype == "raster":
+            if ltype == "tile":
+                style = TileStyle(**{k: v for k, v in raw_style.items() if hasattr(TileStyle(), k)})
+            elif ltype == "raster":
                 style = RasterStyle(**{k: v for k, v in raw_style.items() if hasattr(RasterStyle(), k)})
             else:
                 style = VectorStyle(**{k: v for k, v in raw_style.items() if hasattr(VectorStyle(), k)})
