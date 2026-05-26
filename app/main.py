@@ -52,6 +52,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     get_orchestrator_graph()
     logger.info("LLM service, intent graph, and orchestrator graph initialised")
 
+    # Initialize Google Earth Engine
+    from app.analysis.base import init_gee
+    try:
+        init_gee()
+        logger.info("Google Earth Engine initialised")
+    except Exception as e:
+        logger.error("Failed to initialise Google Earth Engine: %s", str(e))
+
     # Create tables — safe for dev. In production, use Alembic.
     if settings.is_development:
         try:

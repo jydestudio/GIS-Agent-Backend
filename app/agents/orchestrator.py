@@ -21,6 +21,7 @@ from app.agents.tools.map_making import create_cartographic_map
 from app.agents.prompts import INTENT_EXTRACTION_SYSTEM_PROMPT
 from app.models.schemas import ProjectIntent
 from app.agents.tools.gee_tools import search_gee_catalog
+from app.agents.tools.analysis_runner import run_gee_analysis
 
 import json
 
@@ -31,10 +32,9 @@ logger = get_logger(__name__)
 TOOLS = [
     extract_project_intent,
     download_admin_boundary,
-    get_slope_map,
-    get_contour_map,
     create_cartographic_map,
     search_gee_catalog,
+    run_gee_analysis,
 ]
 
 tool_node = ToolNode(TOOLS)
@@ -156,66 +156,11 @@ async def call_model(state: AgentState) -> dict[str, Any]:
 
 
 
-async def refine_response(state: AgentState) -> dict[str, Any]:
-    """
-    Final node to clean up the agent's response for the user.
-    Hides internal logs, error recovery steps, and technical paths.
-    """
-    logger.info("orchestrator — refining final response")
-    messages = state["messages"]
-    last_ai_msg = [m for m in messages if isinstance(m, AIMessage)][-1].content
-    
-    refine_prompt = f"""
-    You are a Senior GIS Editor. Your task is to polish a draft response from a GIS AI agent.
-    
-    DRAFT RESPONSE:
-    "{last_ai_msg}"
-    
-    RULES:
-    1.  **STRIP** all internal error logs (e.g., "I encountered an error...", "I will try a different color...").
-    2.  **STRIP** all raw file paths (e.g., "/home/jydestudios/...") and URLs (e.g., "/api/v1/...").
-    3.  **KEEP** and highlight the key analysis results (e.g., Area in sq km).
-    4.  **TONE**: Professional, concise, and analysis-oriented.
-    5.  **CONTEXT**: The user can already see the maps and images rendered in their chat. Focus on what they mean, not that they were "saved".
-    6. YOUR RESPONSE MUST BE SOMETHING THAT CONCERNS THE USER. THE PROCESS THAT GOES ON TO GET THE RESULT IS NOT IMPORTANT, JUST PROVIDE INSIGHT TO THE OUPUT. NOT WHERE WHAT IS SAVED OR WHAT ERROR HAPPENED
-    OUTPUT ONLY THE POLISHED MARKDOWN TEXT.
-    """
-    
-    llm = get_llm_service().llm
-    response = await llm.ainvoke(refine_prompt, config={"tags": ["hide_from_stream"]})
-    
-    # Replace the last AI message with the refined version
-    # Note: We keep the history, just update the final perspective
-    refined_messages = messages[:-1] + [AIMessage(content=response.content)]
-    
-    return {"messages": refined_messages}
-
-
-def should_continue(state: AgentState) -> Literal["tools", "refine", END]:
+def should_continue(state: AgentState) -> Literal["tools", END]:
     """Route based on whether the last message is a tool call."""
     last_message = state["messages"][-1]
     if last_message.tool_calls:
         return "tools"
-    
-    # If the last message was tool output (it's from the tools node), 
-    # we let the agent summarize first. 
-    # But if the agent has already spoken after the tools, we refine it.
-    
-    # Check if we have an AI message after the last ToolMessage
-    has_summary = False
-    for m in reversed(state["messages"]):
-        if isinstance(m, AIMessage) and not m.tool_calls:
-            has_summary = True
-            break
-        if isinstance(m, HumanMessage):
-             break
-
-    # If it's a direct response or a summary after tools, send to refiner
-    if not last_message.tool_calls:
-        # Avoid infinite refinement loops by checking if we just came from 'refine'
-        # In this simple graph, it only hits 'agent' once after 'tools' before ending
-        return "refine"
-
     return END
 
 
@@ -224,12 +169,12 @@ def should_continue(state: AgentState) -> Literal["tools", "refine", END]:
 def build_orchestrator_graph() -> StateGraph:
     """
     Build the orchestrator graph.
+    agent → tools → agent → ... → END
     """
     graph = StateGraph(AgentState)
     
     graph.add_node("agent", call_model)
     graph.add_node("tools", tool_node)
-    graph.add_node("refine", refine_response)
     
     graph.set_entry_point("agent")
     
@@ -238,13 +183,11 @@ def build_orchestrator_graph() -> StateGraph:
         should_continue,
         {
             "tools": "tools",
-            "refine": "refine",
             END: END
         }
     )
     
     graph.add_edge("tools", "agent")
-    graph.add_edge("refine", END)
     
     return graph
 
