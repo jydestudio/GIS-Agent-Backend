@@ -96,7 +96,10 @@ Thumbs.db
 
 # Geospatial Data and Outputs
 # Ignore raw data or large files
-data/
+data/*
+!data/vector_stores/
+data/vector_stores/*
+!data/vector_stores/gee_index/
 outputs/
 output_maps/
 *.tif
