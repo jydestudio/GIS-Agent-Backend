@@ -40,7 +40,7 @@ def run_gee_analysis(
         "This is a full local path ending in .geojson. "
         "Do NOT use the 'url' field — use 'file_path'."
     )],
-    params: Annotated[dict, (
+    params: Annotated[dict | None, (
         "Optional parameters. Supported keys: "
         "'scale' (int, resolution in metres, default 30), "
         "'interval' (int, contour interval in metres, default 20), "
@@ -81,6 +81,9 @@ def run_gee_analysis(
                     f"Valid tasks are: {', '.join(VALID_TASKS)}"
                 )
             })
+            
+        if params is None:
+            params = {}
 
         result = ROUTER[task](dataset_id, boundary_path, params)
         result["task"] = task

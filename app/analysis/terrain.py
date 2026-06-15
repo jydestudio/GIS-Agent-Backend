@@ -79,8 +79,8 @@ def _merge_vis_params(
     if manual_min is not None or manual_max is not None:
         if manual_min is not None: vis["min"] = manual_min
         if manual_max is not None: vis["max"] = manual_max
-    elif not is_slope_or_hillshade:
-        # Auto-stretch for DEM, Contour, etc.
+    elif default_ramp != "hillshade":
+        # Auto-stretch dynamically for everything except Hillshade
         stat_min = next((v for k, v in stats.items() if k.endswith("_min")), None)
         stat_max = next((v for k, v in stats.items() if k.endswith("_max")), None)
         if stat_min is not None and stat_max is not None:
@@ -88,6 +88,51 @@ def _merge_vis_params(
             vis["max"] = stat_max
             
     return vis
+
+
+def _resample_palette(palette: list, num_colors: int) -> list:
+    import matplotlib.colors as mcolors
+    import numpy as np
+    cmap = mcolors.LinearSegmentedColormap.from_list("custom", palette)
+    return [mcolors.to_hex(cmap(i)) for i in np.linspace(0, 1, num_colors)]
+
+
+def _segment_raster(
+    image: ee.Image,
+    vis_params: dict,
+    classes: int = 5,
+    strategy: str = "equal_interval"
+) -> tuple[ee.Image, dict]:
+    """
+    Classify a continuous raster into discrete semantic bins while preserving
+    the original data scale (e.g., meters or degrees) so legends remain accurate.
+    Returns the binned image and an updated vis_params with a discrete palette.
+    """
+    min_val = vis_params.get("min", 0)
+    max_val = vis_params.get("max", 1)
+    
+    # Update the palette to have exactly 'classes' distinct colors
+    original_palette = vis_params.get("palette", [])
+    if original_palette:
+        vis_params["palette"] = _resample_palette(original_palette, classes)
+
+    if strategy == "equal_interval":
+        if max_val <= min_val:
+            return image, vis_params
+            
+        # Calculate the size of each bucket
+        step = (max_val - min_val) / classes
+        
+        # Clamp the image to prevent values > max_val from creating an extra class
+        clamped = image.clamp(min_val, max_val - 0.0001)
+        
+        # Bin calculation: floor((image - min) / step) * step + min + (step/2)
+        binned = clamped.subtract(min_val).divide(step).floor().multiply(step).add(min_val).add(step / 2.0)
+        
+        return binned.updateMask(image.mask()), vis_params
+    else:
+        # Fallback if strategy is changed in the code
+        return image, vis_params
 
 
 # ── DEM ───────────────────────────────────────────────────────────────────────
@@ -110,7 +155,10 @@ def compute_dem(
     stats          = get_gee_stats(dem, geometry, scale=analysis_scale)
     vis_params     = _merge_vis_params(DEM_VIS, stats, params, "terrain")
 
-    tile_url       = get_tile_url(dem, vis_params)
+    # Segment into 5 discrete classes (Semantic Segmentation)
+    segmented_dem, vis_params = _segment_raster(dem, vis_params, classes=5, strategy="equal_interval")
+
+    tile_url       = get_tile_url(segmented_dem, vis_params)
     export_options = calculate_export_options(area_sqkm)
 
     export_id = save_export_record({
@@ -158,7 +206,10 @@ def compute_slope(
     stats          = get_gee_stats(slope, geometry, scale=analysis_scale)
     vis_params     = _merge_vis_params(SLOPE_VIS, stats, params, "slope")
 
-    tile_url       = get_tile_url(slope, vis_params)
+    # Segment into 5 discrete classes (Semantic Segmentation)
+    segmented_slope, vis_params = _segment_raster(slope, vis_params, classes=5, strategy="equal_interval")
+
+    tile_url       = get_tile_url(segmented_slope, vis_params)
     export_options = calculate_export_options(area_sqkm)
 
     export_id = save_export_record({

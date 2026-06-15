@@ -121,7 +121,7 @@ class NorthArrowConfig:
     image_path: str = ""             # Path to custom north arrow PNG
     zoom: float = 0.15
     offset_x: float = 0.09          # Fraction offset from corner
-    offset_y: float = 0.05
+    offset_y: float = 0.09          # Symmetrical offset to prevent passing grid box
     fallback_color: str = "black"
     fallback_fontsize: int = 13
 
@@ -628,6 +628,7 @@ def _render_raster_layer(
     ax: plt.Axes,
     raster_path: str,
     style: RasterStyle,
+    legend_handles: list = None
 ) -> np.ndarray:
     """Plot a single raster band on ax. Returns the bounds array."""
     if not HAS_RASTERIO:
@@ -655,15 +656,34 @@ def _render_raster_layer(
         )
 
         if style.show_colorbar:
-            cbar = plt.colorbar(
-                im, ax=ax,
-                orientation=style.colorbar_orientation,
-                shrink=style.colorbar_shrink,
-                pad=style.colorbar_pad
-            )
-            if style.colorbar_label:
-                cbar.set_label(style.colorbar_label, fontsize=9)
-            cbar.ax.tick_params(labelsize=8)
+            if legend_handles is not None:
+                # ArcGIS-style discrete legend (5 items)
+                cmap = plt.get_cmap(style.colormap)
+                colors = [mcolors.to_hex(cmap(val)) for val in np.linspace(0, 1, 5)]
+                
+                step = (vmax - vmin) / 5
+                for i in range(5):
+                    c_min = vmin + i * step
+                    c_max = vmin + (i + 1) * step
+                    label = f"{c_min:.1f} - {c_max:.1f}"
+                    legend_handles.append(
+                        mpatches.Patch(
+                            facecolor=colors[i],
+                            edgecolor="#333333",
+                            linewidth=0.8,
+                            label=label
+                        )
+                    )
+            else:
+                cbar = plt.colorbar(
+                    im, ax=ax,
+                    orientation=style.colorbar_orientation,
+                    shrink=style.colorbar_shrink,
+                    pad=style.colorbar_pad
+                )
+                if style.colorbar_label:
+                    cbar.set_label(style.colorbar_label, fontsize=9)
+                cbar.ax.tick_params(labelsize=8)
 
         return np.array([bounds.left, bounds.bottom, bounds.right, bounds.top])
 
@@ -678,6 +698,7 @@ def _render_tile_layer(
     style: TileStyle,
     xlim: tuple,
     ylim: tuple,
+    legend_handles: list = None
 ) -> None:
     """
     Overlay a GEE XYZ tile layer on the axes and draw a matching colorbar.
@@ -694,8 +715,8 @@ def _render_tile_layer(
 
     # ── Determine zoom level ──────────────────────────────────
     # Higher zoom = more tiles = better resolution but slower.
-    # GEE tiles are 256×256; we need enough zoom so that the
-    # composited image looks sharp at the output DPI.
+    # We balance between looking sharp and not hanging the system
+    # with hundreds of sequential tile requests.
     if style.zoom is not None:
         zoom = style.zoom
     else:
@@ -712,6 +733,8 @@ def _render_tile_layer(
             else 9  if extent_m < 600_000 # large state / small country
             else 8                        # country-scale
         )
+        
+    logger.info("Tile layer extent_m: %.2f, selected zoom: %d", extent_m if 'extent_m' in locals() else 0, zoom)
 
     # ── Fetch and overlay tiles ───────────────────────────────
     ctx.add_basemap(
@@ -724,24 +747,44 @@ def _render_tile_layer(
         zorder=2,
     )
 
-    # ── Draw colorbar from palette ────────────────────────────
+    # ── Draw colorbar or discrete legend ──────────────────────
     if style.show_colorbar and style.palette and style.vmin is not None and style.vmax is not None:
-        cmap = mcolors.LinearSegmentedColormap.from_list(
-            "gee_palette", style.palette, N=256
-        )
-        norm = mcolors.Normalize(vmin=style.vmin, vmax=style.vmax)
-        sm   = ScalarMappable(cmap=cmap, norm=norm)
-        sm.set_array([])
+        if legend_handles is not None:
+            # ArcGIS-style discrete legend (5 items)
+            # Find colors
+            from app.analysis.terrain import _resample_palette
+            colors = _resample_palette(style.palette, 5)
+            
+            step = (style.vmax - style.vmin) / 5
+            for i in range(5):
+                c_min = style.vmin + i * step
+                c_max = style.vmin + (i + 1) * step
+                label = f"{c_min:.1f} - {c_max:.1f}"
+                legend_handles.append(
+                    mpatches.Patch(
+                        facecolor=colors[i],
+                        edgecolor="#333333",
+                        linewidth=0.8,
+                        label=label
+                    )
+                )
+        else:
+            cmap = mcolors.LinearSegmentedColormap.from_list(
+                "gee_palette", style.palette, N=256
+            )
+            norm = mcolors.Normalize(vmin=style.vmin, vmax=style.vmax)
+            sm   = ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
 
-        cbar = plt.colorbar(
-            sm, ax=ax,
-            orientation=style.colorbar_orientation,
-            shrink=style.colorbar_shrink,
-            pad=style.colorbar_pad,
-        )
-        if style.colorbar_label:
-            cbar.set_label(style.colorbar_label, fontsize=9)
-        cbar.ax.tick_params(labelsize=8)
+            cbar = plt.colorbar(
+                sm, ax=ax,
+                orientation=style.colorbar_orientation,
+                shrink=style.colorbar_shrink,
+                pad=style.colorbar_pad,
+            )
+            if style.colorbar_label:
+                cbar.set_label(style.colorbar_label, fontsize=9)
+            cbar.ax.tick_params(labelsize=8)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -769,7 +812,25 @@ def render_map(
     -------
     str : Absolute path to the saved PNG file.
     """
-    fig, ax = plt.subplots(figsize=(config.fig_width, config.fig_height))
+    # ── Check if any layer is raster/tile with colorbar/legend enabled ──────
+    has_raster_legend = False
+    for layer in layers:
+        ltype = layer.get("type", "vector").lower()
+        style = layer.get("style")
+        if ltype in ("raster", "tile"):
+            if style and getattr(style, "show_colorbar", False):
+                has_raster_legend = True
+                # Auto-set the legend title from the colorbar label if not already manually set
+                cbar_lbl = getattr(style, "colorbar_label", "")
+                if cbar_lbl and not config.legend.title:
+                    config.legend.title = cbar_lbl
+
+    fig_width = config.fig_width
+    if has_raster_legend:
+        # Dynamically widen the figure to accommodate the external side legend
+        fig_width = max(fig_width, 13.0)
+
+    fig, ax = plt.subplots(figsize=(fig_width, config.fig_height))
     ax.set_facecolor(config.background_color)
 
     all_bounds: list[np.ndarray] = []
@@ -795,7 +856,7 @@ def render_map(
         elif ltype == "raster":
             if style is None:
                 style = RasterStyle()
-            bounds = _render_raster_layer(ax, data, style)
+            bounds = _render_raster_layer(ax, data, style, legend_handles)
             all_bounds.append(bounds)
 
         elif ltype in ("vector", "csv"):
@@ -855,9 +916,18 @@ def render_map(
         extent_m = max(master_bounds[2] - master_bounds[0],
                        master_bounds[3] - master_bounds[1]) * 111000
         if config.basemap_zoom is None:
-            z = 20 if extent_m < 300 else 18 if extent_m < 800 else 16
+            z = (
+                18 if extent_m < 500
+                else 16 if extent_m < 2_000
+                else 14 if extent_m < 10_000
+                else 12 if extent_m < 50_000
+                else 10 if extent_m < 150_000
+                else 8  if extent_m < 500_000
+                else 6
+            )
         else:
             z = config.basemap_zoom
+        logger.info("Basemap extent_m: %.2f, selected zoom: %d", extent_m, z)
         ctx.add_basemap(
             ax, crs="EPSG:4326", source=config.basemap_url,
             zoom=z, attribution=False, zorder=1
@@ -871,6 +941,7 @@ def render_map(
             style=tile_layer["style"],
             xlim=xlim,
             ylim=ylim,
+            legend_handles=legend_handles
         )
 
     # ── Spines ───────────────────────────────────────────────
@@ -903,17 +974,32 @@ def render_map(
 
         all_handles = legend_handles + extra
         if all_handles:
-            ax.legend(
-                handles=all_handles,
-                title=config.legend.title,
-                title_fontsize=config.legend.title_fontsize,
-                loc=config.legend.location,
-                fontsize=config.legend.fontsize,
-                frameon=config.legend.frameon,
-                framealpha=config.legend.framealpha,
-                edgecolor=config.legend.edgecolor,
-                ncol=config.legend.ncol,
-            )
+            if has_raster_legend:
+                # Place discrete legend outside on the right (ArcGIS style)
+                ax.legend(
+                    handles=all_handles,
+                    title=config.legend.title,
+                    title_fontsize=config.legend.title_fontsize,
+                    loc="upper left",
+                    bbox_to_anchor=(1.05, 1.0),
+                    fontsize=config.legend.fontsize,
+                    frameon=config.legend.frameon,
+                    framealpha=config.legend.framealpha,
+                    edgecolor=config.legend.edgecolor,
+                    ncol=config.legend.ncol,
+                )
+            else:
+                ax.legend(
+                    handles=all_handles,
+                    title=config.legend.title,
+                    title_fontsize=config.legend.title_fontsize,
+                    loc=config.legend.location,
+                    fontsize=config.legend.fontsize,
+                    frameon=config.legend.frameon,
+                    framealpha=config.legend.framealpha,
+                    edgecolor=config.legend.edgecolor,
+                    ncol=config.legend.ncol,
+                )
 
     # ── Save ──────────────────────────────────────────────────
     out_dir = os.path.dirname(os.path.abspath(config.output_path))
