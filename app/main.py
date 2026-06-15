@@ -130,6 +130,7 @@ def create_app() -> FastAPI:
         response_model=HealthResponse,
         summary="Health check",
         tags=["system"],
+        methods=["GET", "HEAD"],
     )
     async def health_check() -> HealthResponse:
         return HealthResponse(
