@@ -125,12 +125,12 @@ def create_app() -> FastAPI:
 
     application.include_router(v1_router)
 
-    @application.get(
+    @application.api_route(
         "/",
+        methods=["GET", "HEAD"],
         response_model=HealthResponse,
         summary="Health check",
         tags=["system"],
-        methods=["GET", "HEAD"],
     )
     async def health_check() -> HealthResponse:
         return HealthResponse(
