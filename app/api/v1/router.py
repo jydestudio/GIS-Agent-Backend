@@ -148,7 +148,7 @@ async def chat(
 
                 latency_ms = int((time.perf_counter() - start_time) * 1000)
                 # Ensure the final state has the full content for 'lastIntent' persistence in the frontend
-                yield f"data: {json.dumps({
+                completion_payload = {
                     'status': 'completed', 
                     'session_id': str(session_id), 
                     'thread_id': request.thread_id,
@@ -156,7 +156,8 @@ async def chat(
                     'latency_ms': latency_ms,
                     'model_used': llm_service.model_name,
                     'created_at': datetime.now(timezone.utc).isoformat()
-                })}\n\n"
+                }
+                yield f"data: {json.dumps(completion_payload)}\n\n"
                 
             except Exception as e:
                 logger.error("Chat streaming failed: %s", str(e))
